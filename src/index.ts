@@ -21,6 +21,7 @@ interface LicenseEntry {
   tables_enabled: boolean;
   created: string;
   notes?: string;
+  dek?: string; // Base64-encoded 32-byte AES key for content encryption
 }
 
 interface JwtPayload {
@@ -130,6 +131,7 @@ export default {
         expires_in: 86400,
         tier: license.tier,
         customer: license.customer,
+        dek: license.dek || null,
       });
     }
 
