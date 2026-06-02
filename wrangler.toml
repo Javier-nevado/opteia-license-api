@@ -1,0 +1,18 @@
+name = "opteia-license-api"
+main = "src/index.ts"
+compatibility_date = "2026-06-01"
+
+routes = [
+  { pattern = "api.opteia.com/*", zone_name = "opteia.com" }
+]
+
+kv_namespaces = [
+  { binding = "LICENSES", id = "b88b0aed85fd4e199cee3d4c4558db3a" }
+]
+
+[vars]
+ENVIRONMENT = "production"
+
+# Secrets (set via `wrangler secret put`):
+# - LICENSE_JWT_SECRET: HMAC-SHA256 shared secret
+# - INVOICE_NINJA_WEBHOOK_SECRET: HMAC for IN webhook verification
