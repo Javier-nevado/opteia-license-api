@@ -18,11 +18,14 @@ interface LicenseEntry {
   tier: string;
   customer: string;
   expires: string | null;
-  tables_enabled: boolean;
+  tables_enabled?: boolean; // Legacy — derived from tier if absent
   created: string;
   notes?: string;
   dek?: string; // Base64-encoded 32-byte AES key for content encryption
 }
+
+// Tiers that include custom tables access
+const TABLES_TIERS = new Set(["forge", "partner", "internal"]);
 
 interface JwtPayload {
   license_key: string;
@@ -112,6 +115,9 @@ export default {
         }
       }
 
+      // Derive tables_enabled from tier (support legacy KV flag)
+      const tablesEnabled = TABLES_TIERS.has(license.tier) || Boolean(license.tables_enabled);
+
       // Build and sign JWT
       const now = Math.floor(Date.now() / 1000);
       const payload: JwtPayload = {
@@ -119,7 +125,7 @@ export default {
         tier: license.tier,
         customer: license.customer,
         expires: license.expires,
-        tables_enabled: license.tables_enabled,
+        tables_enabled: tablesEnabled,
         iat: now,
         exp: now + 86400, // 24 hours
       };
@@ -153,7 +159,7 @@ export default {
         tier: license.tier,
         customer: license.customer,
         expires: license.expires,
-        tables_enabled: license.tables_enabled,
+        tables_enabled: TABLES_TIERS.has(license.tier) || Boolean(license.tables_enabled),
       });
     }
 
