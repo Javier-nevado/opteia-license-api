@@ -19,10 +19,10 @@
 set -euo pipefail
 
 API_BASE="https://api.opteia.com"
-STATUS_FILE="/opt/abi-tools/update-status.json"
+STATUS_FILE="${ABI_STATUS_FILE:-/opt/abi-tools/update-status.json}"
 HERMES_DIR="${HERMES_DIR:-$HOME/.hermes/hermes-agent}"
 LICENSE_KEY="${OPTEIA_LICENSE_KEY:-}"
-SERVICE_NAME="${ABI_SERVICE_NAME:-$SERVICE_NAME}"
+SERVICE_NAME="${ABI_SERVICE_NAME:-hermes-gateway}"
 
 # Parse args
 MODE=""
@@ -65,7 +65,8 @@ ensure_status_dir() {
 write_status() {
   local json="$1"
   ensure_status_dir
-  echo "$json" | sudo tee "$STATUS_FILE" > /dev/null 2>/dev/null || echo "$json" > "$STATUS_FILE" 2>/dev/null || true
+  { echo "$json" | sudo tee "$STATUS_FILE" > /dev/null 2>/dev/null; } || \
+  { echo "$json" > "$STATUS_FILE" 2>/dev/null; } || true
 }
 
 # ---------------------------------------------------------------------------
