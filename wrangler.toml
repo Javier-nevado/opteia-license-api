@@ -13,6 +13,11 @@ kv_namespaces = [
 [vars]
 ENVIRONMENT = "production"
 
+# R2 bucket for ABI release tarballs
+[[r2_buckets]]
+binding = "RELEASES"
+bucket_name = "opteia-abi-releases"
+
 # Secrets (set via `wrangler secret put`):
 # - LICENSE_JWT_SECRET: HMAC-SHA256 shared secret
 # - INVOICE_NINJA_WEBHOOK_SECRET: HMAC for IN webhook verification
