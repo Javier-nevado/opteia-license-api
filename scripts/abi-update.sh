@@ -22,6 +22,7 @@ API_BASE="https://api.opteia.com"
 STATUS_FILE="/opt/abi-tools/update-status.json"
 HERMES_DIR="${HERMES_DIR:-$HOME/.hermes/hermes-agent}"
 LICENSE_KEY="${OPTEIA_LICENSE_KEY:-}"
+SERVICE_NAME="${ABI_SERVICE_NAME:-$SERVICE_NAME}"
 
 # Parse args
 MODE=""
@@ -111,13 +112,19 @@ EOF
 apply_update() {
   echo "Checking for updates..."
   local response
-  response="$(curl -sf "$API_BASE/update/check?license_key=$LICENSE_KEY&current_version=$CURRENT_VERSION")"
+  # Use version 0.0.0 to always get download URL (needed for --force reinstall)
+  local check_version="$CURRENT_VERSION"
+  if [ "$FORCE" = true ]; then
+    check_version="0.0.0"
+  fi
+  response="$(curl -sf "$API_BASE/update/check?license_key=$LICENSE_KEY&current_version=$check_version")"
 
   local update_available
   update_available="$(echo "$response" | python3 -c "import json,sys; print(json.load(sys.stdin).get('update_available',False))")"
 
-  if [ "$update_available" != "True" ] && [ "$FORCE" != true ]; then
-    echo "No update available. Use --force to reinstall current version."
+  if [ "$update_available" != "True" ]; then
+    echo "No update available and no download URL. Check API response."
+    echo "$response" | python3 -m json.tool 2>/dev/null || echo "$response"
     return 1
   fi
 
@@ -158,18 +165,36 @@ EOF
     docker compose --env-file docker.env -f docker-compose.abi-api.yml build 2>&1 | tail -3
   fi
 
-  # Detect service manager
-  local svc_cmd=""
-  if systemctl --user status hermes-gateway &>/dev/null 2>&1; then
-    svc_cmd="systemctl --user"
-  elif sudo systemctl status hermes-gateway &>/dev/null 2>&1; then
-    svc_cmd="sudo systemctl"
+  # Detect service manager and agent users
+  # Multi-agent: each user runs their own abi-agent/hermes-gateway service
+  local svc_type=""  # "user" or "system"
+  local agent_users=""
+
+  # Check for multi-agent setup (users with abi-agent services)
+  for u in $(ls /home/ 2>/dev/null); do
+    if id "$u" &>/dev/null && [ -d "/home/$u/.hermes" ]; then
+      agent_users="$agent_users $u"
+    fi
+  done
+
+  if [ -n "$agent_users" ]; then
+    svc_type="user"
+    echo "Detected multi-agent setup with users:$agent_users"
+  elif sudo systemctl status $SERVICE_NAME &>/dev/null 2>&1; then
+    svc_type="system"
   fi
 
   # Stop services
   echo "Stopping services..."
-  if [ -n "$svc_cmd" ]; then
-    $svc_cmd stop hermes-gateway 2>/dev/null || true
+  if [ "$svc_type" = "user" ]; then
+    for u in $agent_users; do
+      local uid
+      uid="$(id -u "$u")"
+      echo "  Stopping $SERVICE_NAME for $u..."
+      sudo -u "$u" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user stop $SERVICE_NAME 2>/dev/null || true
+    done
+  elif [ "$svc_type" = "system" ]; then
+    sudo systemctl stop $SERVICE_NAME 2>/dev/null || true
   fi
   if [ -f docker-compose.abi-api.yml ] && [ -f docker.env ]; then
     docker compose --env-file docker.env -f docker-compose.abi-api.yml down abi-api 2>/dev/null || true
@@ -184,12 +209,15 @@ EOF
   if [ -f docker-compose.abi-api.yml ] && [ -f docker.env ]; then
     docker compose --env-file docker.env -f docker-compose.abi-api.yml up -d abi-api 2>&1 | tail -3
   fi
-  if [ -n "$svc_cmd" ]; then
-    if [ "$svc_cmd" = "systemctl --user" ]; then
-      XDG_RUNTIME_DIR="/run/user/$(id -u)" $svc_cmd start hermes-gateway
-    else
-      $svc_cmd start hermes-gateway
-    fi
+  if [ "$svc_type" = "user" ]; then
+    for u in $agent_users; do
+      local uid
+      uid="$(id -u "$u")"
+      echo "  Starting $SERVICE_NAME for $u..."
+      sudo -u "$u" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user start $SERVICE_NAME 2>/dev/null || true
+    done
+  elif [ "$svc_type" = "system" ]; then
+    sudo systemctl start $SERVICE_NAME 2>/dev/null || true
   fi
 
   # Health check
