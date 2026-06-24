@@ -13,7 +13,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-HERMES_DIR="/home/jnevado/claude-workspace-Opteia/_hermes-agent"
+# Source repo (Javier-nevado/hermes-agent, abi/main). Override with HERMES_DIR env.
+HERMES_DIR="${HERMES_DIR:-/home/jnevado/claude-workspace-Opteia/workspace/hermes-agent-work}"
+# Canonical shared-MCP-skills repo, overlaid into the tarball at build time.
+# Private — needs `gh auth setup-git` (credential helper) or a token in the git URL.
+ABI_SKILLS_REPO="${ABI_SKILLS_REPO:-https://github.com/Javier-nevado/abi-skills.git}"
 R2_BUCKET="opteia-abi-releases"
 KV_BINDING="LICENSES"
 MANIFEST_KEY="releases:latest"
@@ -59,9 +63,34 @@ echo "Source:   $HERMES_DIR"
 echo "Tarball:  $TARBALL_NAME"
 echo ""
 
-# Create tarball via git archive (clean, respects .gitignore)
+# Stage a clean release tree: committed hermes-agent + shared skills from abi-skills.
+# `git archive` only ships committed content, so we stage on a throwaway branch in a
+# temp CLONE of the working copy and archive THAT branch — origin of both repos stays
+# untouched and the working copy's uncommitted state is never released.
+STAGE_DIR="$(mktemp -d)"
+cleanup_stage() { rm -rf "$STAGE_DIR"; }
+trap cleanup_stage EXIT
+echo "Staging release tree (hermes-agent + abi-skills/shared)..."
+if ! git clone -q --depth 1 "file://$HERMES_DIR" "$STAGE_DIR/hermes-agent"; then
+  echo "ERROR: could not clone hermes-agent from $HERMES_DIR" >&2
+  exit 1
+fi
+if ! git clone -q --depth 1 "$ABI_SKILLS_REPO" "$STAGE_DIR/abi-skills"; then
+  echo "ERROR: could not clone $ABI_SKILLS_REPO (private — run 'gh auth setup-git' or embed a token)." >&2
+  exit 1
+fi
+mkdir -p "$STAGE_DIR/hermes-agent/opteia-skills/shared" "$STAGE_DIR/hermes-agent/opteia-skills/scripts"
+cp -a "$STAGE_DIR/abi-skills/skills/." "$STAGE_DIR/hermes-agent/opteia-skills/shared/"
+cp -a "$STAGE_DIR/abi-skills/scripts/." "$STAGE_DIR/hermes-agent/opteia-skills/scripts/" 2>/dev/null || true
+(
+  cd "$STAGE_DIR/hermes-agent" || exit 1
+  git checkout -q -b "release-stage-$VERSION"
+  git add -A opteia-skills
+  git -c user.email=release@opteia -c user.name="ABI Release" commit -q -m "stage: bundle abi-skills shared skills for release $VERSION"
+)
+
 echo "Creating tarball..."
-git -C "$HERMES_DIR" archive --format=tar.gz --prefix="hermes-agent/" -o "$TARBALL_PATH" HEAD
+git -C "$STAGE_DIR/hermes-agent" archive --format=tar.gz --prefix="hermes-agent/" -o "$TARBALL_PATH" "release-stage-$VERSION"
 
 TARBALL_SIZE="$(du -h "$TARBALL_PATH" | cut -f1)"
 SHA256="$(sha256sum "$TARBALL_PATH" | cut -d' ' -f1)"
@@ -87,6 +116,12 @@ if [ "$DRY_RUN" = true ]; then
 EOF
   rm -rf "$TMPDIR"
   exit 0
+fi
+
+# Require a Cloudflare API token for real publishes (dry-run is exempt)
+if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+  echo "ERROR: CLOUDFLARE_API_TOKEN not set. Export it, or run with --dry-run." >&2
+  exit 1
 fi
 
 # Upload to R2

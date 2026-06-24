@@ -166,6 +166,24 @@ EOF
     docker compose --env-file docker.env -f docker-compose.abi-api.yml build 2>&1 | tail -3
   fi
 
+  # Read opt-in compose profiles (e.g. kanban) from docker.env -> "--profile <p>" flags
+  local profile_flags=""
+  if [ -f docker.env ]; then
+    local profiles
+    profiles="$(grep -E '^COMPOSE_PROFILES=' docker.env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr ',' ' ')"
+    for p in $profiles; do
+      [ -n "$p" ] && profile_flags="$profile_flags --profile $p"
+    done
+  fi
+  [ -n "$profile_flags" ] && echo "Compose profiles enabled:$profile_flags"
+
+  # Pre-flight: pull camofox (~2.24GB) so a network failure ABORTS before we stop services
+  echo "Pre-pulling service images (camofox)..."
+  if ! docker compose --env-file docker.env -f docker-compose.abi-api.yml $profile_flags pull camofox 2>&1 | tail -3; then
+    echo "FATAL: camofox image pull failed — aborting BEFORE stopping services (network issue?)." >&2
+    exit 1
+  fi
+
   # Detect service manager and agent users
   # Multi-agent: each user runs their own abi-agent/hermes-gateway service
   local svc_type=""  # "user" or "system"
@@ -198,17 +216,45 @@ EOF
     sudo systemctl stop $SERVICE_NAME 2>/dev/null || true
   fi
   if [ -f docker-compose.abi-api.yml ] && [ -f docker.env ]; then
-    docker compose --env-file docker.env -f docker-compose.abi-api.yml down abi-api 2>/dev/null || true
+    docker compose --env-file docker.env -f docker-compose.abi-api.yml stop abi-api 2>/dev/null || true
   fi
 
   # Extract tarball
   echo "Extracting update..."
   tar -xzf "$tarball" -C "$HERMES_DIR" --strip-components=1
 
+  # Reconcile skills shipped in the new tarball (shared MCP + per-agent standard)
+  echo "Reconciling skills..."
+  if [ -d "$HERMES_DIR/opteia-skills/shared" ]; then
+    sudo mkdir -p /opt/abi-tools/skills
+    if command -v rsync >/dev/null 2>&1; then
+      sudo rsync -a --delete "$HERMES_DIR/opteia-skills/shared/" /opt/abi-tools/skills/
+    else
+      sudo cp -a "$HERMES_DIR/opteia-skills/shared/." /opt/abi-tools/skills/
+    fi
+    sudo chown -R root:abi-agents /opt/abi-tools/skills 2>/dev/null || sudo chown -R root:root /opt/abi-tools/skills
+    sudo chmod -R g+rX /opt/abi-tools/skills
+    echo "  shared MCP skills -> /opt/abi-tools/skills"
+  fi
+  if [ -n "$agent_users" ] && [ -d "$HERMES_DIR/opteia-skills/standard" ]; then
+    for u in $agent_users; do
+      sudo -u "$u" mkdir -p "/home/$u/.hermes/skills/opteia/standard"
+      sudo cp -a "$HERMES_DIR/opteia-skills/standard/." "/home/$u/.hermes/skills/opteia/standard/"
+      sudo chown -R "$u:$u" "/home/$u/.hermes/skills/opteia/standard"
+    done
+    echo "  standard skills -> per-agent ~/.hermes/skills/opteia/standard"
+    # Materialize per-skill credentials.env from the VM master .env
+    if [ -f "$HERMES_DIR/opteia-skills/scripts/abi_skill_sync_creds.py" ]; then
+      for u in $agent_users; do
+        sudo -u "$u" python3 "$HERMES_DIR/opteia-skills/scripts/abi_skill_sync_creds.py" 2>/dev/null || true
+      done
+    fi
+  fi
+
   # Restart services
   echo "Restarting services..."
   if [ -f docker-compose.abi-api.yml ] && [ -f docker.env ]; then
-    docker compose --env-file docker.env -f docker-compose.abi-api.yml up -d abi-api 2>&1 | tail -3
+    docker compose --env-file docker.env -f docker-compose.abi-api.yml $profile_flags up -d 2>&1 | tail -3
   fi
   if [ "$svc_type" = "user" ]; then
     for u in $agent_users; do
