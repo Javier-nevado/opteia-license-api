@@ -184,23 +184,26 @@ EOF
     exit 1
   fi
 
-  # Detect service manager and agent users
-  # Multi-agent: each user runs their own abi-agent/hermes-gateway service
+  # Detect service manager. Prefer an ACTIVE system service (customers + Snowbytes
+  # run system hermes-gateway even though the agent user also has ~/.hermes); fall
+  # back to multi-agent user-level services (.19 runs a per-user abi-agent). Override
+  # the service name with ABI_SERVICE_NAME (e.g. abi-agent on .19).
   local svc_type=""  # "user" or "system"
   local agent_users=""
 
-  # Check for multi-agent setup (users with abi-agent services)
-  for u in $(ls /home/ 2>/dev/null); do
-    if id "$u" &>/dev/null && [ -d "/home/$u/.hermes" ]; then
-      agent_users="$agent_users $u"
-    fi
-  done
-
-  if [ -n "$agent_users" ]; then
-    svc_type="user"
-    echo "Detected multi-agent setup with users:$agent_users"
-  elif sudo systemctl status $SERVICE_NAME &>/dev/null 2>&1; then
+  if sudo systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
     svc_type="system"
+    echo "Detected system service: $SERVICE_NAME"
+  else
+    for u in $(ls /home/ 2>/dev/null); do
+      if id "$u" &>/dev/null && [ -d "/home/$u/.hermes" ]; then
+        agent_users="$agent_users $u"
+      fi
+    done
+    if [ -n "$agent_users" ]; then
+      svc_type="user"
+      echo "Detected multi-agent (user-level) setup with users:$agent_users"
+    fi
   fi
 
   # Stop services
