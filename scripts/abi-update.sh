@@ -218,10 +218,23 @@ EOF
     sudo systemctl stop $SERVICE_NAME 2>/dev/null || true
   fi
   if [ -f docker-compose.abi-api.yml ] && [ -f docker.env ]; then
-    docker compose --env-file docker.env -f docker-compose.abi-api.yml stop abi-api 2>/dev/null || true
+    # Stop ALL compose services (incl. profile services) so bind-mounts kanboard
+    # holds are released before extract. Never 'down' (rule 15) — 'stop' keeps volumes.
+    docker compose --env-file docker.env -f docker-compose.abi-api.yml $profile_flags stop 2>/dev/null || true
   fi
 
-  # Extract tarball
+  # Kanboard's rw bind-mounts (data/, plugins/) are written by the container's
+  # www-data, which maps to a *different* host uid (e.g. dhcpcd/uuidd). The agent
+  # user can't overwrite them -> extract dies on "Cannot utime: Operation not
+  # permitted". chown just those dirs to the agent user so the extract (run as the
+  # agent user) can refresh the stock. The container runs as root and re-claims
+  # write access on next start. NB: we do NOT sudo the whole tar — the runtime
+  # writes __pycache__ into the code dir, so it must stay agent-owned.
+  if [ -d "$HERMES_DIR/kanboard" ]; then
+    sudo chown -R "$(id -u):$(id -g)" "$HERMES_DIR/kanboard/data" "$HERMES_DIR/kanboard/plugins" 2>/dev/null || true
+  fi
+
+  # Extract tarball (as the agent user — keeps the code dir agent-owned).
   echo "Extracting update..."
   tar -xzf "$tarball" -C "$HERMES_DIR" --strip-components=1
 
