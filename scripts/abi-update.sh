@@ -170,7 +170,7 @@ EOF
   local profile_flags=""
   if [ -f docker.env ]; then
     local profiles
-    profiles="$(grep -E '^COMPOSE_PROFILES=' docker.env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr ',' ' ')"
+    profiles="$(grep -E '^COMPOSE_PROFILES=' docker.env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr ',' ' ' || true)"
     for p in $profiles; do
       [ -n "$p" ] && profile_flags="$profile_flags --profile $p"
     done
@@ -184,26 +184,25 @@ EOF
     exit 1
   fi
 
-  # Detect service manager. Prefer an ACTIVE system service (customers + Snowbytes
-  # run system hermes-gateway even though the agent user also has ~/.hermes); fall
-  # back to multi-agent user-level services (.19 runs a per-user abi-agent). Override
-  # the service name with ABI_SERVICE_NAME (e.g. abi-agent on .19).
-  local svc_type=""  # "user" or "system"
+  # Detect agent users (for skills reconcile) — orthogonal to service type. Always
+  # populated so standard skills land even in system-service mode.
   local agent_users=""
+  for u in $(ls /home/ 2>/dev/null); do
+    if id "$u" &>/dev/null && [ -d "/home/$u/.hermes" ]; then
+      agent_users="$agent_users $u"
+    fi
+  done
 
+  # Detect service manager: active system service => system mode (customers +
+  # Snowbytes run system hermes-gateway); else multi-agent user-level (.19 runs a
+  # per-user abi-agent). Override the name with ABI_SERVICE_NAME (e.g. abi-agent).
+  local svc_type=""  # "user" or "system"
   if sudo systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
     svc_type="system"
-    echo "Detected system service: $SERVICE_NAME"
-  else
-    for u in $(ls /home/ 2>/dev/null); do
-      if id "$u" &>/dev/null && [ -d "/home/$u/.hermes" ]; then
-        agent_users="$agent_users $u"
-      fi
-    done
-    if [ -n "$agent_users" ]; then
-      svc_type="user"
-      echo "Detected multi-agent (user-level) setup with users:$agent_users"
-    fi
+    echo "Detected system service: $SERVICE_NAME (agent users:$agent_users)"
+  elif [ -n "$agent_users" ]; then
+    svc_type="user"
+    echo "Detected multi-agent (user-level) setup with users:$agent_users"
   fi
 
   # Stop services
