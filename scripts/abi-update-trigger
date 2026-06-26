@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# abi-update-trigger — hardened root entry point for ABI agent self-update.
+#
+# This is the ONLY thing the agent user may run as root (via a NOPASSWD sudoers
+# rule pinned to this exact path). It whitelists its own arguments, ignores
+# caller-supplied environment, and either runs the read-only check inline or
+# defers the destructive apply to a transient systemd unit so the gateway (the
+# agent itself) is not killed mid-turn.
+#
+# Install: root:root 0755, `chattr +i`. Sudoers:
+#   Defaults!<user> env_reset, secure_path="...", use_pty, !setenv
+#   <user> ALL=(root) NOPASSWD: /opt/abi-tools/abi-update-trigger
+#
+# Usage:
+#   abi-update-trigger check                    # inline read-only check
+#   abi-update-trigger apply [<X.Y.Z>]          # defer apply ~30s; optional consented version
+#   abi-update-trigger schedule <on-calendar>   # schedule a deferred apply
+set -euo pipefail
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+unset IFS
+
+UPDATE=/opt/abi-tools/abi-update.sh
+PUBKEY=/opt/abi-tools/abi-release.pub
+AUDIT_LOG=/opt/abi-tools/update-audit.log
+BACKUP_DIR=/opt/abi-tools/backups
+HERMES=/opt/hermes-agent          # PINNED — never trust a caller-supplied HERMES_DIR
+
+usage() { echo "usage: abi-update-trigger {check|apply [<X.Y.Z>] | schedule <on-calendar>}" >&2; exit 2; }
+
+# --- Integrity self-checks ---------------------------------------------------
+# Refuse unless a path is owned by root AND not writable by group/other. If an
+# agent could write the code dir or the updater, it could plant code that runs
+# as root during apply.
+assert_root_readonly() {
+  local path="$1" u g mode
+  u="$(stat -c '%U' "$path" 2>/dev/null)" || { echo "REFUSE: $path not found." >&2; exit 1; }
+  g="$(stat -c '%G' "$path" 2>/dev/null)"
+  mode="$(stat -c '%A' "$path" 2>/dev/null)"
+  [ "$u" = "root" ] || { echo "REFUSE: $path owner is '$u', must be root." >&2; exit 1; }
+  # mode string: -rwxrwxrwx / drwxrwxrwx — offsets 5 and 8 are group/other write.
+  [ "${mode:5:1}" != "w" ] || { echo "REFUSE: $path is group-writable." >&2; exit 1; }
+  [ "${mode:8:1}" != "w" ] || { echo "REFUSE: $path is other-writable." >&2; exit 1; }
+}
+assert_root_readonly "$HERMES"
+assert_root_readonly "$UPDATE"
+
+# --- Audit (append-only, hash-chained). Written as root; +a set by installer.
+audit() {
+  local action="$1" detail="$2" ts user prev this
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  user="${SUDO_USER:-${USER:-unknown}}"
+  prev="$(tail -1 "$AUDIT_LOG" 2>/dev/null | cut -d'|' -f1 || true)"
+  [ -z "$prev" ] && prev="0000000000000000000000000000000000000000000000000000000000000000"
+  this="$(printf '%s|%s|%s|%s|%s' "$prev" "$ts" "$user" "$action" "$detail" | sha256sum | cut -d' ' -f1)"
+  ( umask 077; mkdir -p "$(dirname "$AUDIT_LOG")" 2>/dev/null || true )
+  printf '%s|%s|%s|%s|%s\n' "$this" "$ts" "$user" "$action" "$detail" >> "$AUDIT_LOG" 2>/dev/null || true
+}
+
+# --- arg dispatch ------------------------------------------------------------
+[ $# -ge 1 ] || usage
+cmd="$1"; shift || true
+
+case "$cmd" in
+  check)
+    # Inline read-only check (no service disruption). Clean env.
+    exec env -i PATH="$PATH" HOME=/root HERMES_DIR="$HERMES" \
+         "$UPDATE" --check-only
+    ;;
+
+  apply)
+    target="${1:-}"
+    if [ -n "$target" ]; then
+      [[ "$target" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "REFUSE: bad version '$target'." >&2; exit 2; }
+    fi
+    # Singleton guard: never let two applies queue/run at once.
+    if systemctl list-units --all 'abi-update-apply-*' --no-legend 2>/dev/null | grep -q .; then
+      echo "REFUSE: an apply is already queued or running. Wait for it to finish." >&2
+      audit apply_refused "apply-in-progress"
+      exit 1
+    fi
+    unit="abi-update-apply-$$"
+    set -- --apply
+    [ -n "$target" ] && set -- --apply --expect-version "$target"
+    systemd-run --on-active=30s --unit="$unit" \
+      "$UPDATE" "$@"
+    audit apply_scheduled "expect=${target:-any} unit=$unit"
+    echo "Update scheduled: applying in ~30s as systemd unit '$unit' (expect: ${target:-any})."
+    echo "The gateway will be offline for ~2-3 minutes during the apply."
+    ;;
+
+  schedule)
+    cal="${1:-}"
+    [ -n "$cal" ] || usage
+    [[ "$cal" =~ ^[A-Za-z0-9\ \*,-:/]+$ ]] || { echo "REFUSE: bad on-calendar expression." >&2; exit 2; }
+    # One schedule at a time: drop any prior scheduled apply.
+    systemctl list-units --all 'abi-update-sched-*' --no-legend 2>/dev/null \
+      | awk '{print $1}' | xargs -r systemctl stop 2>/dev/null || true
+    unit="abi-update-sched-$$"
+    systemd-run --on-calendar="$cal" --unit="$unit" "$UPDATE" --apply
+    audit schedule_scheduled "cal=$cal unit=$unit"
+    echo "Scheduled apply for '$cal' as systemd unit '$unit'."
+    ;;
+
+  *)
+    usage
+    ;;
+esac

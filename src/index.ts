@@ -35,6 +35,7 @@ interface ReleaseManifest {
   checksum_sha256: string;
   released_at: string;
   release_notes: string;
+  signature: string; // base64 minisign signature over "version\ntarball_key\nsha256\nreleased_at"
 }
 
 interface JwtPayload {
@@ -270,6 +271,7 @@ export default {
         checksum_sha256: manifest.checksum_sha256,
         released_at: manifest.released_at,
         release_notes: manifest.release_notes,
+        signature: manifest.signature || "",
       });
     }
 

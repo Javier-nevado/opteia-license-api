@@ -94,6 +94,7 @@ git -C "$STAGE_DIR/hermes-agent" archive --format=tar.gz --prefix="hermes-agent/
 
 TARBALL_SIZE="$(du -h "$TARBALL_PATH" | cut -f1)"
 SHA256="$(sha256sum "$TARBALL_PATH" | cut -d' ' -f1)"
+RELEASED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 echo "Size:     $TARBALL_SIZE"
 echo "SHA256:   $SHA256"
@@ -110,8 +111,9 @@ if [ "$DRY_RUN" = true ]; then
   "version": "$VERSION",
   "tarball_key": "$R2_KEY",
   "checksum_sha256": "$SHA256",
-  "released_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "release_notes": "${NOTES:-Release $VERSION}"
+  "released_at": "$RELEASED_AT",
+  "release_notes": "${NOTES:-Release $VERSION}",
+  "signature": "<minisign signature computed at publish>"
 }
 EOF
   rm -rf "$TMPDIR"
@@ -129,11 +131,35 @@ echo "Uploading to R2..."
 cd "$WORKER_DIR"
 CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}" npx wrangler r2 object put "$R2_BUCKET/$R2_KEY" --file "$TARBALL_PATH" --remote --content-type="application/gzip" 2>&1 | tail -3
 
+# Sign the canonical manifest with the offline minisign release key. The secret
+# key lives ONLY on the release host (0600, empty password for CI, backed up
+# offline); the matching public key ships to VMs. An attacker who compromises
+# the Worker/KV/R2 can rewrite the tarball AND checksum_sha256, but cannot forge
+# this signature. Fail-closed: never publish an unsigned release.
+MINISIGN_SECKEY="${MINISIGN_SECKEY:-$HOME/.minisign/abi-release.key}"
+SIGNATURE=""
+if ! command -v minisign >/dev/null 2>&1; then
+  echo "ERROR: minisign not installed on the release host (apt install minisign)." >&2; exit 1
+fi
+[ -f "$MINISIGN_SECKEY" ] || {
+  echo "ERROR: minisign secret key not found at $MINISIGN_SECKEY." >&2
+  echo "       Generate: minisign -G -p abi-release.pub -s \"\$MINISIGN_SECKEY\" (empty password for CI)." >&2
+  exit 1
+}
+echo "Signing release manifest (minisign, -H prehash)..."
+printf '%s\n%s\n%s\n%s' "$VERSION" "$R2_KEY" "$SHA256" "$RELEASED_AT" > "$TMPDIR/manifest.txt"
+# minisign reads its password from /dev/tty only; the pty helper feeds it from
+# MINISIGN_PASSPHRASE_FILE (default ~/.minisign/abi-release.pw, 0600) so the
+# release pipeline runs unattended. Empty passphrase => key has empty password.
+MINISIGN_PASSPHRASE_FILE="${MINISIGN_PASSPHRASE_FILE:-$HOME/.minisign/abi-release.pw}" \
+  python3 "$SCRIPT_DIR/abi-minisign-sign.py" \
+  minisign -S -s "$MINISIGN_SECKEY" -m "$TMPDIR/manifest.txt" -x "$TMPDIR/manifest.minisig" -t "abi $VERSION" -H
+SIGNATURE="$(base64 -w0 < "$TMPDIR/manifest.minisig")"
+
 # Update KV manifest
 echo "Updating KV manifest..."
-RELEASED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 MANIFEST_JSON="$(cat <<EOF
-{"version":"$VERSION","tarball_key":"$R2_KEY","checksum_sha256":"$SHA256","released_at":"$RELEASED_AT","release_notes":"${NOTES:-Release $VERSION}"}
+{"version":"$VERSION","tarball_key":"$R2_KEY","checksum_sha256":"$SHA256","released_at":"$RELEASED_AT","release_notes":"${NOTES:-Release $VERSION}","signature":"$SIGNATURE"}
 EOF
 )"
 if ! CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}" npx wrangler kv:key put "$MANIFEST_KEY" --binding "$KV_BINDING" "$MANIFEST_JSON" 2>&1 | tail -3; then

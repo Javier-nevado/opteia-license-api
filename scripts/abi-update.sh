@@ -20,7 +20,17 @@ set -euo pipefail
 
 API_BASE="https://api.opteia.com"
 STATUS_FILE="${ABI_STATUS_FILE:-/opt/abi-tools/update-status.json}"
-HERMES_DIR="${HERMES_DIR:-$HOME/.hermes/hermes-agent}"
+if [ -z "${HERMES_DIR:-}" ]; then
+  # Auto-detect Hermes dir. System-mode deploys (all customers + Snowbytes) keep
+  # Hermes at /opt/hermes-agent; multi-agent setups use per-user ~/.hermes/hermes-agent.
+  # NB: under `sudo`, $HOME=/root, so defaulting to $HOME silently breaks system mode
+  # (license grep fails -> exit 2). Prefer /opt/hermes-agent when its VERSION exists.
+  if [ -f /opt/hermes-agent/VERSION ]; then
+    HERMES_DIR="/opt/hermes-agent"
+  else
+    HERMES_DIR="$HOME/.hermes/hermes-agent"
+  fi
+fi
 LICENSE_KEY="${OPTEIA_LICENSE_KEY:-}"
 SERVICE_NAME="${ABI_SERVICE_NAME:-hermes-gateway}"
 
@@ -28,6 +38,8 @@ SERVICE_NAME="${ABI_SERVICE_NAME:-hermes-gateway}"
 MODE=""
 FORCE=false
 SCHEDULE_TIME=""
+EXPECT_VERSION=""   # --expect-version: refuse unless manifest matches (TOCTOU guard)
+ROLLBACK_SNAPSHOT=""  # --rollback <path>: explicit manual restore
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -35,12 +47,14 @@ while [[ $# -gt 0 ]]; do
     --apply) MODE="apply"; shift ;;
     --schedule) MODE="schedule"; SCHEDULE_TIME="$2"; shift 2 ;;
     --force) FORCE=true; shift ;;
+    --expect-version) EXPECT_VERSION="$2"; shift 2 ;;
+    --rollback) MODE="rollback"; ROLLBACK_SNAPSHOT="${2:-}"; shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
 
 if [ -z "$MODE" ]; then
-  echo "Usage: abi-update.sh --check-only | --apply [--force] | --schedule '<time>'"
+  echo "Usage: abi-update.sh --check-only | --apply [--force] [--expect-version X.Y.Z] | --schedule '<time>' | --rollback [<snapshot>]"
   exit 1
 fi
 
@@ -75,7 +89,7 @@ write_status() {
 check_for_update() {
   echo "Checking for updates (current: $CURRENT_VERSION)..."
   local response
-  response="$(curl -sf "$API_BASE/update/check?license_key=$LICENSE_KEY&current_version=$CURRENT_VERSION")"
+  response="$(curl -sf -G "$API_BASE/update/check" --data-urlencode "license_key=$LICENSE_KEY" --data-urlencode "current_version=$CURRENT_VERSION")"
 
   local update_available
   update_available="$(echo "$response" | python3 -c "import json,sys; print(json.load(sys.stdin).get('update_available',False))" 2>/dev/null)"
@@ -118,7 +132,7 @@ apply_update() {
   if [ "$FORCE" = true ]; then
     check_version="0.0.0"
   fi
-  response="$(curl -sf "$API_BASE/update/check?license_key=$LICENSE_KEY&current_version=$check_version")"
+  response="$(curl -sf -G "$API_BASE/update/check" --data-urlencode "license_key=$LICENSE_KEY" --data-urlencode "current_version=$check_version")"
 
   local update_available
   update_available="$(echo "$response" | python3 -c "import json,sys; print(json.load(sys.stdin).get('update_available',False))")"
@@ -129,12 +143,26 @@ apply_update() {
     return 1
   fi
 
-  local latest download_url checksum
+  local latest download_url checksum signature released_at
   latest="$(echo "$response" | python3 -c "import json,sys; print(json.load(sys.stdin)['latest_version'])")"
   download_url="$(echo "$response" | python3 -c "import json,sys; print(json.load(sys.stdin)['download_url'])")"
   checksum="$(echo "$response" | python3 -c "import json,sys; print(json.load(sys.stdin)['checksum_sha256'])")"
+  signature="$(echo "$response" | python3 -c "import json,sys; print(json.load(sys.stdin).get('signature',''))")"
+  released_at="$(echo "$response" | python3 -c "import json,sys; print(json.load(sys.stdin).get('released_at',''))")"
 
   echo "Updating: $CURRENT_VERSION → $latest"
+
+  # TOCTOU guard: if the caller consented to a specific version (the agent passed
+  # --expect-version from the chat yes), refuse when the manifest now advertises
+  # something different (e.g. it was re-published between check and apply).
+  if [ -n "$EXPECT_VERSION" ] && [ "$latest" != "$EXPECT_VERSION" ]; then
+    echo "FATAL: manifest version ($latest) != expected ($EXPECT_VERSION). Aborting (consent/version mismatch)." >&2
+    write_status "$(cat <<EOF
+{"update_available":false,"current_version":"$CURRENT_VERSION","latest_version":"$latest","release_notes":"","scheduled_at":null,"scheduled_by":"$(whoami)","status":"refused_version_mismatch","expected_version":"$EXPECT_VERSION"}
+EOF
+)"
+    exit 1
+  fi
 
   # Write status
   write_status "$(cat <<EOF
@@ -158,6 +186,44 @@ EOF
     exit 1
   fi
   echo "Checksum verified."
+
+  # Verify the minisign signature over the canonical manifest. This is the check
+  # sha256 CANNOT provide: if an attacker compromises the Worker/KV/R2 and
+  # re-publishes a backdoored tarball, they also rewrite checksum_sha256 — but
+  # they cannot mint a valid minisign signature without the offline release key.
+  # Fail-closed on a present-but-invalid signature; warn (fall back to sha256)
+  # only for legacy unsigned releases during the rollout transition.
+  local tarball_key="releases/abi-${latest}.tar.gz"
+  printf '%s\n%s\n%s\n%s' "$latest" "$tarball_key" "$checksum" "$released_at" > "$tmpdir/manifest.txt"
+  printf '%s' "$signature" | base64 -d > "$tmpdir/manifest.minisig" 2>/dev/null || true
+  if [ -n "$signature" ]; then
+    if ! command -v minisign >/dev/null 2>&1; then
+      echo "minisign not found — installing (apt)..." >&2
+      apt-get install -y -qq minisign >/dev/null 2>&1 || true
+    fi
+    if ! command -v minisign >/dev/null 2>&1; then
+      echo "FATAL: minisign unavailable and a signature is present — cannot verify authenticity. Aborting." >&2
+      rm -rf "$tmpdir"; exit 1
+    fi
+    local verified=false pk
+    for pk in /opt/abi-tools/abi-release.pub; do
+      [ -f "$pk" ] || continue
+      if minisign -V -p "$pk" -m "$tmpdir/manifest.txt" -x "$tmpdir/manifest.minisig" -H -q >/dev/null 2>&1; then
+        verified=true; break
+      fi
+    done
+    if [ "$verified" != true ]; then
+      echo "FATAL: minisign signature verification failed — refusing to apply an untrusted tarball." >&2
+      write_status "$(cat <<EOF
+{"update_available":false,"current_version":"$CURRENT_VERSION","latest_version":"$latest","release_notes":"","scheduled_at":null,"scheduled_by":"$(whoami)","status":"refused_bad_signature"}
+EOF
+)"
+      rm -rf "$tmpdir"; exit 1
+    fi
+    echo "minisign signature verified."
+  else
+    echo "WARNING: release carries no minisign signature (legacy/unsigned) — authenticity rests on sha256 only." >&2
+  fi
 
   # Pre-build Docker image (while services still running)
   echo "Pre-building ABI API Docker image..."
@@ -212,10 +278,10 @@ EOF
       local uid
       uid="$(id -u "$u")"
       echo "  Stopping $SERVICE_NAME for $u..."
-      sudo -u "$u" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user stop $SERVICE_NAME 2>/dev/null || true
+      sudo -u "$u" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user stop "$SERVICE_NAME" 2>/dev/null || true
     done
   elif [ "$svc_type" = "system" ]; then
-    sudo systemctl stop $SERVICE_NAME 2>/dev/null || true
+    sudo systemctl stop "$SERVICE_NAME" 2>/dev/null || true
   fi
   if [ -f docker-compose.abi-api.yml ] && [ -f docker.env ]; then
     # Stop ALL compose services (incl. profile services) so bind-mounts kanboard
@@ -233,6 +299,31 @@ EOF
   if [ -d "$HERMES_DIR/kanboard" ]; then
     sudo chown -R "$(id -u):$(id -g)" "$HERMES_DIR/kanboard/data" "$HERMES_DIR/kanboard/plugins" 2>/dev/null || true
   fi
+
+  # --- L4: snapshot current code dir (+ best-effort DB dump) BEFORE mutating ---
+  # Code-dir-only restore is only safe when no DB migration advanced (see the
+  # health-gate below); the DB dump is the evidence/safety-net for the case we
+  # deliberately do NOT auto-restore.
+  local backup_dir="/opt/abi-tools/backups" snap_ts snap_path=""
+  snap_ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  snap_path="$backup_dir/hermes-agent-${CURRENT_VERSION}-${snap_ts}.tar.zst"
+  mkdir -p "$backup_dir" 2>/dev/null || sudo mkdir -p "$backup_dir"
+  echo "Snapshotting $HERMES_DIR -> $snap_path ..."
+  tar --zstd -cf "$snap_path" \
+      --exclude='__pycache__' --exclude='.venv' --exclude='.git' \
+      --exclude='kanboard/data' --exclude='kanboard/plugins' \
+      -C "$(dirname "$HERMES_DIR")" "$(basename "$HERMES_DIR")" 2>/dev/null || \
+    { echo "WARNING: snapshot failed — proceeding WITHOUT a rollback safety net." >&2; snap_path=""; }
+  for _c in abi-memory-db abi-db; do
+    if docker exec "$_c" pg_dump -U abi_agent -d abi_memory >/dev/null 2>&1; then
+      docker exec "$_c" pg_dump -U abi_agent -d abi_memory 2>/dev/null \
+        | gzip > "$backup_dir/abi-memory-${snap_ts}.sql.gz" || rm -f "$backup_dir/abi-memory-${snap_ts}.sql.gz"
+      break
+    fi
+  done
+  # Retain only the last 3 snapshots/dumps
+  ls -1t "$backup_dir"/hermes-agent-*.tar.zst 2>/dev/null | tail -n +4 | xargs -r rm -f
+  ls -1t "$backup_dir"/abi-memory-*.sql.gz 2>/dev/null | tail -n +4 | xargs -r rm -f
 
   # Extract tarball (as the agent user — keeps the code dir agent-owned).
   echo "Extracting update..."
@@ -276,10 +367,10 @@ EOF
       local uid
       uid="$(id -u "$u")"
       echo "  Starting $SERVICE_NAME for $u..."
-      sudo -u "$u" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user start $SERVICE_NAME 2>/dev/null || true
+      sudo -u "$u" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user start "$SERVICE_NAME" 2>/dev/null || true
     done
   elif [ "$svc_type" = "system" ]; then
-    sudo systemctl start $SERVICE_NAME 2>/dev/null || true
+    sudo systemctl start "$SERVICE_NAME" 2>/dev/null || true
   fi
 
   # Health check
@@ -294,7 +385,34 @@ EOF
     sleep 2
   done
   if [ $retries -eq 30 ]; then
-    echo "WARNING: Health check did not pass within 60 seconds. Manual intervention may be needed."
+    echo "HEALTH CHECK FAILED after update $CURRENT_VERSION -> $new_version." >&2
+    # Default: alert-and-stop. A DB migration may have advanced during the new
+    # code's first start; code-dir-only restore would then desync code vs DB and
+    # make things worse. Only opt-in ABI_UNSAFE_CODE_RESTORE=1 (operator is sure
+    # no migration ran) attempts a code-only restore, and even then gives up if
+    # health still fails.
+    if [ "${ABI_UNSAFE_CODE_RESTORE:-0}" = "1" ] && [ -n "$snap_path" ] && [ -f "$snap_path" ]; then
+      echo "ABI_UNSAFE_CODE_RESTORE=1 — attempting code-only restore from $snap_path..." >&2
+      do_rollback "$snap_path" || true
+      if curl -sf http://localhost:8010/health >/dev/null 2>&1; then
+        write_status "$(cat <<EOF
+{"update_available":false,"current_version":"$CURRENT_VERSION","latest_version":"$CURRENT_VERSION","release_notes":"","scheduled_at":null,"scheduled_by":"$(whoami)","status":"rolled_back","failed_version":"$new_version","snapshot":"$snap_path"}
+EOF
+)"
+        echo "Code-only rollback succeeded; back on $CURRENT_VERSION." >&2
+        exit 0
+      fi
+    fi
+    echo "Alert-and-stop: leaving the running state as-is for human review." >&2
+    [ -n "$snap_path" ] && [ -f "$snap_path" ] && echo "  Code snapshot:    $snap_path" >&2
+    ls "$backup_dir"/abi-memory-*.sql.gz >/dev/null 2>&1 && \
+      echo "  DB dump (latest): $(ls -1t "$backup_dir"/abi-memory-*.sql.gz | head -1)" >&2
+    echo "  Manual rollback:  /opt/abi-tools/abi-update.sh --rollback \"$snap_path\"" >&2
+    write_status "$(cat <<EOF
+{"update_available":false,"current_version":"$new_version","latest_version":"$new_version","release_notes":"","scheduled_at":null,"scheduled_by":"$(whoami)","status":"failed","previous_version":"$CURRENT_VERSION","snapshot":"$snap_path"}
+EOF
+)"
+    exit 1
   fi
 
   # Cleanup
@@ -312,6 +430,52 @@ EOF
 
   # Docker cleanup
   docker builder prune -af 2>/dev/null && docker image prune -af 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# ROLLBACK — explicit manual restore of a code-dir snapshot (system mode).
+# NB: code-dir only. Does NOT revert a DB migration — only use when you are
+# certain no schema advanced, otherwise restore the matching abi-memory dump.
+# ---------------------------------------------------------------------------
+do_rollback() {
+  local snap="${1:-}"
+  if [ -z "$snap" ] || [ ! -f "$snap" ]; then
+    snap="$(ls -1t /opt/abi-tools/backups/hermes-agent-*.tar.zst 2>/dev/null | head -1)"
+  fi
+  if [ -z "$snap" ] || [ ! -f "$snap" ]; then
+    echo "ERROR: no snapshot to roll back to in /opt/abi-tools/backups/." >&2
+    exit 1
+  fi
+  echo "Rolling back from snapshot: $snap"
+  if ! tar --zstd -tf "$snap" >/dev/null 2>&1; then
+    echo "FATAL: snapshot $snap is unreadable — aborting rollback to avoid data loss." >&2
+    exit 1
+  fi
+  cd "$HERMES_DIR" 2>/dev/null || true
+  if sudo systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+    sudo systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+  fi
+  if [ -f "$HERMES_DIR/docker-compose.abi-api.yml" ] && [ -f "$HERMES_DIR/docker.env" ]; then
+    docker compose --env-file "$HERMES_DIR/docker.env" -f "$HERMES_DIR/docker-compose.abi-api.yml" stop 2>/dev/null || true
+  fi
+  local base parent
+  base="$(basename "$HERMES_DIR")"
+  parent="$(dirname "$HERMES_DIR")"
+  ( cd "$parent" && rm -rf "$base" && mkdir -p "$base" && tar --zstd -xf "$snap" )
+  if [ -f "$HERMES_DIR/docker-compose.abi-api.yml" ] && [ -f "$HERMES_DIR/docker.env" ]; then
+    docker compose --env-file "$HERMES_DIR/docker.env" -f "$HERMES_DIR/docker-compose.abi-api.yml" up -d 2>&1 | tail -3
+  fi
+  sudo systemctl start "$SERVICE_NAME" 2>/dev/null || true
+  echo "Waiting for health after rollback..."
+  local r
+  for r in $(seq 1 30); do
+    if curl -sf http://localhost:8010/health >/dev/null 2>&1; then echo "Health OK after rollback."; break; fi
+    sleep 2
+  done
+  write_status "$(cat <<EOF
+{"update_available":false,"current_version":"$(cat "$HERMES_DIR/VERSION" 2>/dev/null | tr -d '[:space:]')","latest_version":"","release_notes":"","scheduled_at":null,"scheduled_by":"$(whoami)","status":"rolled_back","snapshot":"$snap"}
+EOF
+)"
 }
 
 # ---------------------------------------------------------------------------
@@ -352,4 +516,5 @@ case "$MODE" in
   check) check_for_update ;;
   apply) apply_update ;;
   schedule) schedule_update ;;
+  rollback) do_rollback "$ROLLBACK_SNAPSHOT" ;;
 esac

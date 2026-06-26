@@ -1,2 +1,7 @@
 node_modules/
 .wrangler/
+
+# minisign release-signing secrets — must NEVER be committed.
+*.key
+*.minisig
+.minisign/
