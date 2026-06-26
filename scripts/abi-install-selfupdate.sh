@@ -32,9 +32,10 @@ done
 
 # Detect the service user if not given: whoever runs the system gateway service.
 if [ -z "$SERVICE_USER" ]; then
-  if systemctl list-unit-files 2>/dev/null | grep -q "^$SERVICE_NAME\.service"; then
-    SERVICE_USER="$(systemctl show "$SERVICE_NAME" -p User --value 2>/dev/null | head -1)"
-  fi
+  for svc in "$SERVICE_NAME.service" "$SERVICE_NAME"; do
+    SERVICE_USER="$(systemctl show "$svc" -p User --value 2>/dev/null | head -1)"
+    [ -n "$SERVICE_USER" ] && break
+  done
 fi
 [ -n "$SERVICE_USER" ] || { echo "Could not detect service user. Pass --user <name>." >&2; exit 1; }
 id "$SERVICE_USER" >/dev/null 2>&1 || { echo "User '$SERVICE_USER' does not exist." >&2; exit 1; }
