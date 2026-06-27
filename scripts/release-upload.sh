@@ -120,9 +120,15 @@ EOF
   exit 0
 fi
 
-# Require a Cloudflare API token for real publishes (dry-run is exempt)
+# Require a Cloudflare API token for real publishes (dry-run is exempt).
+# Source persisted release creds (0600, OUTSIDE any repo) if present so a publish
+# doesn't need a manual export. Write the file yourself in your editor — never
+# paste a token into a transcript.
+for _cred in "$HOME/.config/opteia/cf-release.env"; do
+  [ -f "$_cred" ] && { set -a; . "$_cred"; set +a; }
+done
 if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
-  echo "ERROR: CLOUDFLARE_API_TOKEN not set. Export it, or run with --dry-run." >&2
+  echo "ERROR: CLOUDFLARE_API_TOKEN not set (env or ~/.config/opteia/cf-release.env), or run with --dry-run." >&2
   exit 1
 fi
 
