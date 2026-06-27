@@ -271,6 +271,21 @@ EOF
     echo "Detected multi-agent (user-level) setup with users:$agent_users"
   fi
 
+  # --- L4 (pre-stop): take the DB dump NOW. pg_dump needs the DB container UP,
+  # so it MUST run before we stop services below. The code-dir tar follows later
+  # (pre-extract); it does not need the DB. backup_dir/snap_ts declared here are
+  # reused by the code-tar block.
+  local backup_dir="/opt/abi-tools/backups" snap_ts snap_path=""
+  snap_ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$backup_dir" 2>/dev/null || sudo mkdir -p "$backup_dir"
+  for _c in abi-memory-db abi-db; do
+    if docker exec "$_c" pg_dump -U abi_agent -d abi_memory >/dev/null 2>&1; then
+      docker exec "$_c" pg_dump -U abi_agent -d abi_memory 2>/dev/null \
+        | gzip > "$backup_dir/abi-memory-${snap_ts}.sql.gz" || rm -f "$backup_dir/abi-memory-${snap_ts}.sql.gz"
+      break
+    fi
+  done
+
   # Stop services
   echo "Stopping services..."
   if [ "$svc_type" = "user" ]; then
@@ -300,30 +315,22 @@ EOF
     sudo chown -R "$(id -u):$(id -g)" "$HERMES_DIR/kanboard/data" "$HERMES_DIR/kanboard/plugins" 2>/dev/null || true
   fi
 
-  # --- L4: snapshot current code dir (+ best-effort DB dump) BEFORE mutating ---
-  # Code-dir-only restore is only safe when no DB migration advanced (see the
-  # health-gate below); the DB dump is the evidence/safety-net for the case we
-  # deliberately do NOT auto-restore.
-  local backup_dir="/opt/abi-tools/backups" snap_ts snap_path=""
-  snap_ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  # --- L4 (pre-extract): snapshot the code dir. The DB dump was taken above
+  # (pre-stop, while the DB was up). Code-dir-only restore is only safe when no
+  # DB migration advanced (see the health-gate below); the DB dump is the
+  # safety-net for the case we deliberately do NOT auto-restore.
   snap_path="$backup_dir/hermes-agent-${CURRENT_VERSION}-${snap_ts}.tar.zst"
-  mkdir -p "$backup_dir" 2>/dev/null || sudo mkdir -p "$backup_dir"
   echo "Snapshotting $HERMES_DIR -> $snap_path ..."
   tar --zstd -cf "$snap_path" \
       --exclude='__pycache__' --exclude='.venv' --exclude='.git' \
       --exclude='kanboard/data' --exclude='kanboard/plugins' \
       -C "$(dirname "$HERMES_DIR")" "$(basename "$HERMES_DIR")" 2>/dev/null || \
     { echo "WARNING: snapshot failed — proceeding WITHOUT a rollback safety net." >&2; snap_path=""; }
-  for _c in abi-memory-db abi-db; do
-    if docker exec "$_c" pg_dump -U abi_agent -d abi_memory >/dev/null 2>&1; then
-      docker exec "$_c" pg_dump -U abi_agent -d abi_memory 2>/dev/null \
-        | gzip > "$backup_dir/abi-memory-${snap_ts}.sql.gz" || rm -f "$backup_dir/abi-memory-${snap_ts}.sql.gz"
-      break
-    fi
-  done
-  # Retain only the last 3 snapshots/dumps
-  ls -1t "$backup_dir"/hermes-agent-*.tar.zst 2>/dev/null | tail -n +4 | xargs -r rm -f
-  ls -1t "$backup_dir"/abi-memory-*.sql.gz 2>/dev/null | tail -n +4 | xargs -r rm -f
+  # Retain only the last 3 snapshots/dumps. Guard the `ls`: with no match it
+  # exits non-zero, which under `set -o pipefail` would abort the whole apply
+  # before extract — wrap it so a missing dump never kills the update.
+  { ls -1t "$backup_dir"/hermes-agent-*.tar.zst 2>/dev/null || true; } | tail -n +4 | xargs -r rm -f
+  { ls -1t "$backup_dir"/abi-memory-*.sql.gz 2>/dev/null || true; } | tail -n +4 | xargs -r rm -f
 
   # Extract tarball over the code dir. Runs as root (via the wrapper/deferred
   # unit, or Major Tom's sudo), so extracted code files land root-owned.
