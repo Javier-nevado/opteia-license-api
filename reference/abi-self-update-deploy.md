@@ -61,7 +61,23 @@ The installer: `apt install minisign`; drops wrapper + updater + pubkey to
 `/etc/sudoers.d/abi-update` for the service user; sets `chattr +a` on the audit
 log; validates with `visudo -c`. Idempotent — safe to re-run.
 
-## ⚠️ Privilege-boundary caveat: docker group = root
+## ⚠️ Required: the code dir must be root-owned
+
+The wrapper refuses `apply` unless `/opt/hermes-agent` itself is `root:root`
+(mode 755). If the agent user owns the dir, it can delete-and-replace the
+root-owned `docker-compose.abi-api.yml`/`Dockerfile` and inject code into the
+root `docker build`. The runtime does NOT need to own the code dir — only
+`.venv` and `__pycache__` (agent-owned, not in the tarball). So once per VM:
+
+```sh
+sudo chown root:root /opt/hermes-agent      # dir only; .venv/__pycache__ stay agent-owned
+```
+
+`abi-update.sh` re-asserts `chown root:root "$HERMES_DIR"` after every apply.
+Fresh deploys should do the same in `abi-bootstrap.sh` right after the initial
+extract (a one-line addition; lives in the hermes-agent repo).
+
+
 
 The wrapper is a **true** privilege boundary only if the service user is NOT in
 the `docker` group and has no blanket NOPASSWD sudo (the docker socket grants

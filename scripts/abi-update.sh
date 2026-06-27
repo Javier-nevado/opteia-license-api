@@ -325,9 +325,16 @@ EOF
   ls -1t "$backup_dir"/hermes-agent-*.tar.zst 2>/dev/null | tail -n +4 | xargs -r rm -f
   ls -1t "$backup_dir"/abi-memory-*.sql.gz 2>/dev/null | tail -n +4 | xargs -r rm -f
 
-  # Extract tarball (as the agent user — keeps the code dir agent-owned).
+  # Extract tarball over the code dir. Runs as root (via the wrapper/deferred
+  # unit, or Major Tom's sudo), so extracted code files land root-owned.
   echo "Extracting update..."
   tar -xzf "$tarball" -C "$HERMES_DIR" --strip-components=1
+
+  # Enforce the security invariant: the code DIR itself must be root-owned so a
+  # compromised agent can't delete-and-replace the root-owned compose/Dockerfile
+  # and inject code into the root `docker build`. .venv + __pycache__ are NOT in
+  # the archive, so tar leaves them agent-owned (runtime keeps writing them).
+  chown root:root "$HERMES_DIR"
 
   # Reconcile skills shipped in the new tarball (shared MCP + per-agent standard)
   echo "Reconciling skills..."
